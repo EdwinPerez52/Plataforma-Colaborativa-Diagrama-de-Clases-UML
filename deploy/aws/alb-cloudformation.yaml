@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infraestructura Cloud AWS para Plataforma Web CASE UML Colaborativa (UAGRM - SW1)'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'production'
+  VpcCIDR:
+    Type: String
+    Default: '10.0.0.0/16'
+
+Resources:
+  # 1. Red y VPC Multi-AZ
+  CaseVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-case-vpc'
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CaseVPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CaseVPC
+      CidrBlock: '10.0.2.0/24'
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  # 2. Application Load Balancer (ALB) con soporte WebSocket
+  CaseApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-case-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow HTTPS and WSS traffic'
+      VpcId: !Ref CaseVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  AlbTargetGroupBackend:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-tg-backend'
+      Port: 4000
+      Protocol: HTTP
+      VpcId: !Ref CaseVPC
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        # Habilitar sticky sessions para Socket.IO
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: 'lb_cookie'
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+
+  # 3. Amazon RDS PostgreSQL 17 Multi-AZ
+  CaseDatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-case-postgres'
+      Engine: postgres
+      EngineVersion: '17.2'
+      DBInstanceClass: db.t4g.medium
+      AllocatedStorage: 50
+      StorageType: gp3
+      MultiAZ: true
+      DBName: case_collaborative_db
+      MasterUsername: postgres
+      MasterUserPassword: '{{resolve:secretsmanager:case/db_password:SecretString}}'
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      EnablePerformanceInsights: true
+
+  # 4. Amazon ElastiCache Redis para Semáforos y Distribución de Eventos
+  CaseRedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${EnvironmentName}-case-locks'
+      ReplicationGroupDescription: 'Redis para distribucion de bloqueos semaforicos'
+      Engine: redis
+      CacheNodeType: cache.t4g.micro
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
